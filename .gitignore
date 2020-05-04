@@ -1,0 +1,5 @@
+/venv/
+/.idea/
+/tests/start_bot_and_tests.sh
+/tests/run_bot.sh
+/tests/run_tests_only.sh
