@@ -31,7 +31,7 @@ class AdminCommands(NoConflictCog):
         self.bot: MyDiscordBot = bot
         self.__roles: Dict[str, discord.role] = {}
         self.__SUPER_USER_ROLE_NAME = "SuperUser"
-        self.__protections: Dict[str, Set[Union[discord.Role, discord.User]]] = {
+        self.__protections: Dict[str, Set[Union[discord.Role, discord.User, discord.TextChannel]]] = {
             self.qualified_name: set()
         }
         self.__protections_checked = False
@@ -49,7 +49,10 @@ class AdminCommands(NoConflictCog):
                         try:
                             self.__protections.setdefault(protection, set()).add(await self.bot.fetch_user(snowflake))
                         except discord.NotFound:
-                            self.__protections[protection].add(self.bot.guilds[0].get_role(snowflake))
+                            try:
+                                self.__protections[protection].add(self.bot.guilds[0].get_role(snowflake))
+                            except discord.NotFound:
+                                self.__protections[protection].add(self.bot.guilds[0].get_channel(snowflake))
             except FileNotFoundError:
                 self.__protections: Dict[str, Set[Union[discord.Role, discord.User]]] = {
                     self.qualified_name: set()
@@ -106,10 +109,16 @@ class AdminCommands(NoConflictCog):
 
         if ctx.channel is not None and cog is not None:
             if cog.qualified_name in self.__protections:
-                return ctx.author in self.__protections[cog.qualified_name] or self.__protections[cog.qualified_name] \
-                    .difference(set(ctx.author.roles)) is not None or await self.bot.is_owner(ctx.author)
+                return await self.check_restrictions(cog.qualified_name, ctx)
+            if cog.qualified_name + command.qualified_name in self.__protections:
+                return await self.check_restrictions(cog.qualified_name + "__" + command.qualified_name, ctx)
         else:
             return await self.bot.is_owner(ctx.author)
+
+    async def check_restrictions(self, name: str, ctx: commands.Context) -> bool:
+        return ctx.author in self.__protections[name] or self.__protections[name] \
+            .difference(set(ctx.author.roles)) is not None or await self.bot.is_owner(ctx.author) or ctx.channel in \
+            self.__protections
 
     async def cog_check(self, ctx):
         return ctx.guild is not None
@@ -240,7 +249,7 @@ class AdminCommands(NoConflictCog):
     @commands.guild_only()
     @commands.command()
     async def protect_cog(self, ctx: commands.Context, cog_name: str,
-                          role: Optional[Union[discord.Role, discord.User]]):
+                          role: Optional[Union[discord.Role, discord.User, discord.TextChannel]]):
         """
         Protect a cog to a given role
         :param ctx:
@@ -270,7 +279,7 @@ class AdminCommands(NoConflictCog):
 
     @commands.command()
     async def remove_cog_protection(self, ctx: commands.Context, cog_name: str,
-                                    role: Optional[Union[discord.Role, discord.User]]):
+                                    role: Optional[Union[discord.Role, discord.User, discord.TextChannel]]):
         """
         Remove an existing protection from the bot
         :param ctx:
@@ -285,10 +294,10 @@ class AdminCommands(NoConflictCog):
                 protections.remove(super_user_role)
                 await ctx.send(f"{cog_name} unprotected from {self.__SUPER_USER_ROLE_NAME}")
             elif role is None and super_user_role not in protections:
-                await ctx.send(f"Please specify a group to protect {cog_name} to")
+                await ctx.send(f"Please specify a group to unprotect {cog_name} from")
             elif role is not None and role in protections:
-                protections.add(role)
-                await ctx.send(f"{cog_name} protected to {role}")
+                protections.remove(role)
+                await ctx.send(f"{cog_name} unprotected from {role}")
         else:
             if cog_name not in self.bot.cogs:
                 await ctx.send(f"{cog_name} does not exist")
@@ -303,7 +312,7 @@ class AdminCommands(NoConflictCog):
         Used only for debugging purposes
         :return:
         """
-        print(ctx.command)
+        print(ctx.command in ctx.cog.get_commands())
 
     @commands.command()
     async def save_config(self, ctx: commands.Context):
@@ -319,8 +328,49 @@ class AdminCommands(NoConflictCog):
         self.__save_protections()
 
     @commands.command()
-    async def protect_command(self, ctx: commands.Context):
-        pass
+    async def protect_command(self, ctx: commands.Context, cog: str, command: str,
+                              role: Optional[Union[discord.Role, discord.User, discord.TextChannel]]):
+        prepared_name = cog + "__" + command
+        if self.bot.get_cog(cog) is not None and \
+                command in map(lambda x: x.qualified_name, self.bot.get_cog(cog).get_commands()):
+            protections = self.__protections.setdefault(prepared_name, set())
+            super_user_role = self.__roles[self.__SUPER_USER_ROLE_NAME]
+            if role is None and super_user_role not in protections:
+                protections.add(super_user_role)
+                await ctx.send(f"{command} of {cog} is protected to group {self.__SUPER_USER_ROLE_NAME}")
+            elif role is None and super_user_role in protections:
+                await ctx.send(f"{command} of {cog} is protected to group {self.__SUPER_USER_ROLE_NAME}")
+            elif role is not None and role not in protections:
+                protections.add(role)
+                await ctx.send(f"{command} of {cog} is protected to {role.name}")
+        else:
+            await ctx.send(f"{command} of {cog} does not exist")
+        self.__save_protections()
+
+    @commands.command()
+    async def unprotect_command(self, ctx: commands.Context, cog: str, command: str,
+                              role: Optional[Union[discord.Role, discord.User, discord.TextChannel]]):
+        prepared_name = cog + "__" + command
+        if prepared_name in self.__protections:
+            super_user_role = self.__roles[self.__SUPER_USER_ROLE_NAME]
+            protections = self.__protections[prepared_name]
+            if role is None and super_user_role in protections:
+                protections.remove(super_user_role)
+                await ctx.send(f"{prepared_name} unprotected from {self.__SUPER_USER_ROLE_NAME}")
+            elif role is None and super_user_role not in protections:
+                await ctx.send(f"Please specify a group to unprotect {prepared_name} from")
+            elif role is not None and role in protections:
+                protections.remove(role)
+                await ctx.send(f"{prepared_name} unprotected from {role}")
+        else:
+            if cog not in self.bot.cogs:
+                await ctx.send(f"{cog} does not exist")
+            else:
+                if command not in self.bot.cogs[cog].get_commands():
+                    await ctx.send(f"{cog} has no such command {command}")
+                else:
+                    await ctx.send(f"{command} of {cog} has no protections")
+        self.__save_protections()
 
 
 def setup(bot: commands.Bot):
