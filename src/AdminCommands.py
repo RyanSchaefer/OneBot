@@ -2,25 +2,83 @@ from typing import Set, Dict, Optional, Union
 
 import discord
 from discord.ext import commands
+import pickle
 from types import MethodType
 
 from discord.ext.commands import NoPrivateMessage, MissingRole
 
 from NoConflictCog import NoConflictCog
 from bot import MyDiscordBot
+from os import path, makedirs
+
+
+# TODO: Add protections for single command
+#   This will most likely be implemented in the same protections namespace but with a prefix for the cog
+# TODO: Add protection of command to channel
+#   Should just be an expansion of the Union for the mapping of __protections
+# TODO: add "installation" for packaged Extensions that have been vetted
+#   This will require some vetting process and repository for storing them
+#   Look into how to have such a repository, services or open source
+# TODO: (Not priority) Add ability to separate bot into space that can add non-vetted extensions
+#   User would need a subscription to cover the server costs or some other way to monetize (patreon?)
+#   Most likely another subclass in main.bot
+#   Look at stripe for payment processing
 
 
 class AdminCommands(NoConflictCog):
 
     def __init__(self, bot):
-        self.bot: commands.Bot = bot
+        self.bot: MyDiscordBot = bot
+        self.__roles: Dict[str, discord.role] = {}
+        self.__SUPER_USER_ROLE_NAME = "SuperUser"
         self.__protections: Dict[str, Set[Union[discord.Role, discord.User]]] = {
             self.qualified_name: set()
         }
-        self.__roles: Dict[str, discord.role] = {}
-        self.__SUPER_USER_ROLE_NAME = "SuperUser"
+        self.__protections_checked = False
+
+    async def __load_protections(self):
+        """
+        If existing protections exist in the folder add them to be able to protect the cogs on the bot
+        """
+        try:
+            try:
+                config: Dict[str, Set[int]] = pickle.load(
+                    open(path.join("..", str(self.bot.guilds[0].id), self.qualified_name), 'rb'))
+                for protection in config:
+                    for snowflake in config[protection]:
+                        try:
+                            self.__protections.setdefault(protection, set()).add(await self.bot.fetch_user(snowflake))
+                        except discord.NotFound:
+                            self.__protections[protection].add(self.bot.guilds[0].get_role(snowflake))
+            except FileNotFoundError:
+                self.__protections: Dict[str, Set[Union[discord.Role, discord.User]]] = {
+                    self.qualified_name: set()
+                }
+        except IndexError:
+            print("index error")
+
+    def __save_protections(self):
+        """
+        Save existing protections to disk
+        """
+        filename = path.join("..", str(self.bot.guilds[0].id), self.qualified_name)
+        makedirs(path.dirname(filename), exist_ok=True)
+        config: Dict[str, Set[int]] = {}
+        protection: str
+        for protection in self.__protections:
+            config[protection] = set(map(lambda x: x.id, self.__protections[protection]))
+        pickle.dump(config, open(filename, 'wb'))
 
     async def cog_before_invoke(self, ctx):
+        """
+        Before a command within this cog is invoked check if protections have been loaded and if they have not been
+        load them
+        TODO: Might have to move the loading to before any command within the given bot is loaded
+        :param ctx:
+        """
+        if not self.__protections_checked:
+            self.__protections_checked = True
+            await self.__load_protections()
         if self.__roles == {}:
             role: discord.Role
             for role in ctx.guild.roles:
@@ -39,12 +97,22 @@ class AdminCommands(NoConflictCog):
             self.__protections[self.qualified_name].add(self.__roles[self.__SUPER_USER_ROLE_NAME])
 
     async def bot_check(self, ctx: commands.Context) -> bool:
+        """
+        Handles the checking of protections on commands and cogs
+        :return:
+        """
         cog: commands.Cog = ctx.cog
-        if cog.qualified_name in self.__protections:
-            return ctx.author in self.__protections[cog.qualified_name] or self.__protections[cog.qualified_name]\
-                .difference(set(ctx.author.roles)) is not None or await self.bot.is_owner(ctx.author)
+        command: commands.Command = ctx.command
+
+        if ctx.channel is not None and cog is not None:
+            if cog.qualified_name in self.__protections:
+                return ctx.author in self.__protections[cog.qualified_name] or self.__protections[cog.qualified_name] \
+                    .difference(set(ctx.author.roles)) is not None or await self.bot.is_owner(ctx.author)
         else:
             return await self.bot.is_owner(ctx.author)
+
+    async def cog_check(self, ctx):
+        return ctx.guild is not None
 
     @commands.command()
     async def testing_mode(self, ctx: commands.Context, enable_p: bool):
@@ -121,12 +189,21 @@ class AdminCommands(NoConflictCog):
 
     @commands.command()
     async def status(self, ctx: commands.Context):
+        """
+        What are the protections loaded onto the bot?
+        :param ctx:
+        :return:
+        """
         ret = "Current protections:\r"
-        for protection in self.__protections:
-            ret += f"{protection}\r"
-            for accessor in self.__protections[protection]:
-                ret += f"\t{accessor}\r"
-        await ctx.send(ret)
+        end = "Unprotected cogs:\r"
+        for cog in self.bot.cogs:
+            if cog in self.__protections:
+                ret += f"{cog}\r"
+                for accessor in self.__protections[cog]:
+                    ret += f"\t{accessor}\r"
+            else:
+                end += f"{cog}\r"
+        await ctx.send(ret + end)
 
     @commands.command()
     async def load_extension(self, ctx: commands.Context, extension):
@@ -143,6 +220,11 @@ class AdminCommands(NoConflictCog):
 
     @commands.command()
     async def available_commands(self, ctx: commands.Context):
+        """
+        What commands are available for the user to use?
+        :param ctx:
+        :return:
+        """
         cogs: Dict[str, commands.Cog] = ctx.bot.cogs
         print(cogs)
         ret: str = ""
@@ -155,64 +237,90 @@ class AdminCommands(NoConflictCog):
                 ret += f"\t{command.qualified_name}\r"
         await ctx.send(ret)
 
+    @commands.guild_only()
     @commands.command()
-    async def protect_cog(self, ctx: commands.Context, cog_name: str, role: Optional[Union[int, str]]):
-        # check that the cog name exists
-        if cog_name in ctx.bot.cogs:
-            cog: commands.Cog = ctx.bot.get_cog(cog_name)
-            old_check = cog.cog_check.__func__
-            if not role:
-                # if a role was not supplied assume that the user wants to restrict usage of the cog to only sudoers
-                @commands.cog._cog_special_method
-                # this is required to be called because overridden cog methods have a special private attribute added to
-                # them
-                def __check(func, cog_self: commands.Cog, ctx: commands.Context) -> bool:
-                    """
-                    This function wraps an existing cog check with a new one
-                    :param func: the old cog check to wrap
-                    :param cog_self: the cog the check came from
-                    :param ctx: the context we are supplying to the check
-                    """
-                    bot: commands.Bot = ctx.bot
-                    admin: 'AdminCommands' = bot.get_cog("AdminCommands")
-                    if admin:
-                        # if we have loaded the command we can check that the author is in the sudoers
-                        # AND that they passed the original check
-                        return ctx.author in admin.sudoers and func(cog_self, ctx)
-                    # we cannot do anything if AdminCommands is not loaded
-                    return func(cog_self, ctx)
-
-                # This nasty little piece of work is required to dynamically change the method to our new method we
-                # specified
-                cog.cog_check = MethodType(
-                    lambda cog_self, context: __check(old_check, cog_self, context),
-                    cog)
-
-                await ctx.send(f"{cog_name} protected")
-            if role:
-                @commands.cog._cog_special_method
-                def __role_check(func, cog_self: commands.Cog, ctx: commands.Context, role) -> bool:
-                    if not isinstance(ctx.channel, discord.abc.GuildChannel):
-                        raise NoPrivateMessage()
-                    if isinstance(role, int):
-                        r = discord.utils.get(ctx.author.__roles, id=role)
-                    else:
-                        r = discord.utils.get(ctx.author.__roles, name=role)
-                    if r is None:
-                        raise MissingRole(role)
-                    return func(cog_self, ctx)
-
-                cog.cog_check = cog.cog_check = MethodType(
-                    lambda cog_self, context: __role_check(old_check, cog_self, context, role),
-                    cog)
-                await ctx.send(f"{cog_name} protected")
+    async def protect_cog(self, ctx: commands.Context, cog_name: str,
+                          role: Optional[Union[discord.Role, discord.User]]):
+        """
+        Protect a cog to a given role
+        :param ctx:
+        :param cog_name:
+        :param role: if None, protect the role to the super user group, else protect to the role or user given
+        :return:
+        """
+        if self.bot.get_cog(cog_name) is not None:
+            protections = self.__protections.setdefault(cog_name, set())
+            super_user_role = self.__roles[self.__SUPER_USER_ROLE_NAME]
+            if role is None and super_user_role not in protections:
+                protections.add(super_user_role)
+                await ctx.send(f"{cog_name} is protected to group {self.__SUPER_USER_ROLE_NAME}")
+            elif role is None and super_user_role in protections:
+                await ctx.send(f"{cog_name} is protected to group {self.__SUPER_USER_ROLE_NAME}")
+            elif role is not None and role not in protections:
+                protections.add(role)
+                await ctx.send(f"{cog_name} is protected to {role.name}")
         else:
-            await ctx.send("That cog does not exist or is not loaded")
+            await ctx.send(f"{cog_name} does not exist")
+        self.__save_protections()
+
+    @protect_cog.error
+    async def protect_cog_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.BadArgument):
+            await ctx.send("Could not find user or role")
+
+    @commands.command()
+    async def remove_cog_protection(self, ctx: commands.Context, cog_name: str,
+                                    role: Optional[Union[discord.Role, discord.User]]):
+        """
+        Remove an existing protection from the bot
+        :param ctx:
+        :param cog_name: the cog to "unprotect"
+        :param role: if None, remove all protections from the given cog, else attempt to remove the given role
+        :return:
+        """
+        if cog_name in self.__protections:
+            super_user_role = self.__roles[self.__SUPER_USER_ROLE_NAME]
+            protections = self.__protections[cog_name]
+            if role is None and super_user_role in protections:
+                protections.remove(super_user_role)
+                await ctx.send(f"{cog_name} unprotected from {self.__SUPER_USER_ROLE_NAME}")
+            elif role is None and super_user_role not in protections:
+                await ctx.send(f"Please specify a group to protect {cog_name} to")
+            elif role is not None and role in protections:
+                protections.add(role)
+                await ctx.send(f"{cog_name} protected to {role}")
+        else:
+            if cog_name not in self.bot.cogs:
+                await ctx.send(f"{cog_name} does not exist")
+            else:
+                await ctx.send(f"{cog_name} has no protections")
+        self.__save_protections()
 
     @commands.is_owner()
     @commands.command()
     async def print(self, ctx: commands.Context):
-        print(await self.bot.fetch_user(self.bot.owner_id))
+        """
+        Used only for debugging purposes
+        :return:
+        """
+        print(ctx.command)
+
+    @commands.command()
+    async def save_config(self, ctx: commands.Context):
+        """
+        Since the bot cannot be reliably killed if it is in the communal bot space, we must allow the user to save
+        protections at a given point in case the bot were to go down
+        TODO: Possibly make this automatically called at a given interval
+        TODO: Possibly support rolling back changes made within the given interval
+        TODO: Maybe allow premium users to have more extensive history of saves
+        :param ctx:
+        :return:
+        """
+        self.__save_protections()
+
+    @commands.command()
+    async def protect_command(self, ctx: commands.Context):
+        pass
 
 
 def setup(bot: commands.Bot):
